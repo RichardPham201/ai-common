@@ -48,6 +48,43 @@ def handle_message(data):
 queue_service.register_consumer("my_queue", handle_message)
 ```
 
+#### TLS/SSL Support
+
+For secure connections to RabbitMQ servers:
+
+```python
+# Basic TLS connection
+queue_service = RabbitMQService(
+    host="your-rabbitmq-server.com",
+    port=5671,  # TLS port
+    username="your_username",
+    password="your_password",
+    use_tls=True
+)
+
+# TLS with custom CA certificate
+queue_service = RabbitMQService(
+    host="your-rabbitmq-server.com",
+    port=5671,
+    username="your_username", 
+    password="your_password",
+    use_tls=True,
+    ca_cert_path="/path/to/ca-certificate.pem"
+)
+
+# Mutual TLS (client certificate authentication)
+queue_service = RabbitMQService(
+    host="your-rabbitmq-server.com",
+    port=5671,
+    username="your_username",
+    password="your_password", 
+    use_tls=True,
+    ca_cert_path="/path/to/ca-certificate.pem",
+    cert_path="/path/to/client-certificate.pem",
+    key_path="/path/to/client-private-key.pem"
+)
+```
+
 ### GPU Memory Management
 
 ```python
@@ -86,9 +123,9 @@ numpy_array = ImageUtils.pil_to_numpy(pil_image)
 ### AI Model Processor Pattern
 
 ```python
-from ai_common.patterns import BaseProcessor
+from ai_common.patterns import BaseModelProcessor
 
-class MyAIProcessor(BaseProcessor):
+class MyAIProcessor(BaseModelProcessor):
     def _load_model(self, model_path, **kwargs):
         # Your model loading logic
         model = load_your_model(model_path)

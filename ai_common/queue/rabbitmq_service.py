@@ -3,6 +3,7 @@
 import pika
 import json
 import logging
+import ssl
 from typing import Callable, Optional
 from .queue_service import QueueService
 
@@ -16,27 +17,66 @@ class RabbitMQService(QueueService):
                  virtual_host: str = "/", 
                  username: str = "guest", 
                  password: str = "guest",
+                 use_tls: bool = False,
+                 ca_cert_path: Optional[str] = None,
+                 cert_path: Optional[str] = None,
+                 key_path: Optional[str] = None,
+                 verify_hostname: bool = False,
                  logger: Optional[logging.Logger] = None):
         """
         Initialize RabbitMQ service
         
         Args:
             host: RabbitMQ server host
-            port: RabbitMQ server port
+            port: RabbitMQ server port (default: 5672 for non-TLS, 5671 for TLS)
             virtual_host: Virtual host name
             username: Username for authentication
             password: Password for authentication
+            use_tls: Enable TLS/SSL connection
+            ca_cert_path: Path to CA certificate file (for TLS)
+            cert_path: Path to client certificate file (for TLS with client auth)
+            key_path: Path to client private key file (for TLS with client auth)
+            verify_hostname: Whether to verify hostname in TLS connection
             logger: Optional logger instance
         """
         self.host = host
-        self.port = port
+        # Default to TLS port if TLS is enabled and port is default
+        if use_tls and port == 5672:
+            self.port = 5671
+        else:
+            self.port = port
         self.virtual_host = virtual_host
+        self.use_tls = use_tls
+        self.ca_cert_path = ca_cert_path
+        self.cert_path = cert_path
+        self.key_path = key_path
+        self.verify_hostname = verify_hostname
         self.credentials = pika.PlainCredentials(username, password)
+        
+        # Configure SSL context if TLS is enabled
+        ssl_context = None
+        if self.use_tls:
+            ssl_context = ssl.create_default_context()
+            
+            # Load CA certificate if provided
+            if self.ca_cert_path:
+                ssl_context.load_verify_locations(cafile=self.ca_cert_path)
+            
+            # Load client certificate and key if provided
+            if self.cert_path and self.key_path:
+                ssl_context.load_cert_chain(self.cert_path, self.key_path)
+            
+            # Configure hostname verification
+            if not self.verify_hostname:
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+        
         self.connection_params = pika.ConnectionParameters(
             host=self.host,
             port=self.port,
             virtual_host=self.virtual_host,
-            credentials=self.credentials
+            credentials=self.credentials,
+            ssl_options=pika.SSLOptions(ssl_context) if ssl_context else None
         )
         self.logger = logger or logging.getLogger(__name__)
         self._connection = None

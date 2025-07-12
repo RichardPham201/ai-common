@@ -144,5 +144,5 @@ tests/
 examples/local_*
 
 # Other project
-examples
+examples/
 integrate_common.sh
