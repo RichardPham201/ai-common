@@ -33,3 +33,13 @@ class QueueService(ABC):
     def close_connection(self) -> None:
         """Close the connection to the queue service"""
         pass
+
+    @abstractmethod
+    def start_consuming_all(self) -> None:
+        """Start consuming from all registered queues (blocking call)"""
+        pass
+
+    @abstractmethod
+    def stop_consuming(self) -> None:
+        """Stop all consumers"""
+        pass

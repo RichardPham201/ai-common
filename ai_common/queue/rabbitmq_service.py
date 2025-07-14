@@ -4,7 +4,8 @@ import pika
 import json
 import logging
 import ssl
-from typing import Callable, Optional
+import threading
+from typing import Callable, Optional, Dict
 from .queue_service import QueueService
 
 
@@ -80,6 +81,9 @@ class RabbitMQService(QueueService):
         )
         self.logger = logger or logging.getLogger(__name__)
         self._connection = None
+        self._consumers = {}  # Store consumer threads
+        self._consumer_threads = []  # Store thread references
+        self._stop_consuming = False
         
     def _get_connection(self):
         """Get or create a connection to RabbitMQ"""
@@ -120,12 +124,41 @@ class RabbitMQService(QueueService):
     def register_consumer(self, queue_name: str, handler: Callable[[dict], None]) -> None:
         """
         Register a consumer handler for the specified queue
+        Each consumer will run in its own thread with its own connection
+        
+        Args:
+            queue_name: Name of the queue to consume from
+            handler: Callback function to handle incoming messages
+        """
+        if queue_name in self._consumers:
+            self.logger.warning(f"Consumer for queue '{queue_name}' already registered. Skipping.")
+            return
+            
+        # Store consumer info
+        self._consumers[queue_name] = handler
+        
+        # Create and start consumer thread
+        consumer_thread = threading.Thread(
+            target=self._run_consumer,
+            args=(queue_name, handler),
+            daemon=True,
+            name=f"Consumer-{queue_name}"
+        )
+        self._consumer_threads.append(consumer_thread)
+        consumer_thread.start()
+        
+        self.logger.info(f"Consumer registered and started for queue '{queue_name}'")
+
+    def _run_consumer(self, queue_name: str, handler: Callable[[dict], None]) -> None:
+        """
+        Run consumer in its own thread with its own connection
         
         Args:
             queue_name: Name of the queue to consume from
             handler: Callback function to handle incoming messages
         """
         try:
+            # Create dedicated connection for this consumer
             connection = pika.BlockingConnection(self.connection_params)
             channel = connection.channel()
             
@@ -159,24 +192,70 @@ class RabbitMQService(QueueService):
             # Register consumer
             channel.basic_consume(queue=queue_name, on_message_callback=callback)
             
-            self.logger.info(f"Waiting for messages in queue '{queue_name}'. To exit press CTRL+C")
-            channel.start_consuming()
+            self.logger.info(f"Consumer started for queue '{queue_name}' in thread {threading.current_thread().name}")
             
-        except KeyboardInterrupt:
-            self.logger.info("Consumer interrupted by user")
+            # Start consuming in this thread
+            while not self._stop_consuming:
+                try:
+                    connection.process_data_events(time_limit=1)  # Process events with timeout
+                except Exception as e:
+                    if not self._stop_consuming:
+                        self.logger.error(f"Error in consumer for queue '{queue_name}': {str(e)}")
+                        break
+            
+            # Cleanup
             channel.stop_consuming()
             connection.close()
+            self.logger.info(f"Consumer stopped for queue '{queue_name}'")
             
         except Exception as e:
             self.logger.error(f"Error setting up consumer for queue '{queue_name}': {str(e)}")
-            raise
+
+    def start_consuming_all(self) -> None:
+        """
+        Start consuming from all registered queues
+        This is a blocking call that keeps the main thread alive
+        """
+        if not self._consumer_threads:
+            self.logger.warning("No consumers registered")
+            return
+            
+        self.logger.info(f"Started {len(self._consumer_threads)} consumers")
+        
+        try:
+            # Keep main thread alive while consumers run
+            while not self._stop_consuming:
+                import time
+                time.sleep(1)
+                
+                # Check if any consumer threads have died
+                for thread in self._consumer_threads:
+                    if not thread.is_alive():
+                        self.logger.warning(f"Consumer thread {thread.name} died")
+                        
+        except KeyboardInterrupt:
+            self.logger.info("Stopping all consumers...")
+            self.stop_consuming()
+
+    def stop_consuming(self) -> None:
+        """Stop all consumers"""
+        self._stop_consuming = True
+        
+        # Wait for all consumer threads to finish
+        for thread in self._consumer_threads:
+            if thread.is_alive():
+                thread.join(timeout=5)
+                
+        self.logger.info("All consumers stopped")
 
     def close_connection(self) -> None:
-        """Close the connection to RabbitMQ"""
+        """Close all connections and stop consumers"""
+        self.stop_consuming()
+        
         if self._connection and not self._connection.is_closed:
             self._connection.close()
             self.logger.info("RabbitMQ connection closed")
             
     def __del__(self):
-        """Destructor to ensure connection is closed"""
+        """Destructor to ensure connections are closed"""
         self.close_connection()
