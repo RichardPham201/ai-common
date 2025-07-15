@@ -5,6 +5,7 @@ import json
 import logging
 import ssl
 import threading
+import functools
 from typing import Callable, Optional, Dict
 from .queue_service import QueueService
 
@@ -23,6 +24,8 @@ class RabbitMQService(QueueService):
                  cert_path: Optional[str] = None,
                  key_path: Optional[str] = None,
                  verify_hostname: bool = False,
+                 heartbeat: int = 30,
+                 blocked_connection_timeout: int = 300,
                  logger: Optional[logging.Logger] = None):
         """
         Initialize RabbitMQ service
@@ -38,6 +41,8 @@ class RabbitMQService(QueueService):
             cert_path: Path to client certificate file (for TLS with client auth)
             key_path: Path to client private key file (for TLS with client auth)
             verify_hostname: Whether to verify hostname in TLS connection
+            heartbeat: Heartbeat interval in seconds (default: 30)
+            blocked_connection_timeout: Timeout for blocked connections in seconds (default: 300)
             logger: Optional logger instance
         """
         self.host = host
@@ -77,13 +82,18 @@ class RabbitMQService(QueueService):
             port=self.port,
             virtual_host=self.virtual_host,
             credentials=self.credentials,
-            ssl_options=pika.SSLOptions(ssl_context) if ssl_context else None
+            ssl_options=pika.SSLOptions(ssl_context) if ssl_context else None,
+            heartbeat=heartbeat,
+            blocked_connection_timeout=blocked_connection_timeout
         )
         self.logger = logger or logging.getLogger(__name__)
         self._connection = None
         self._consumers = {}  # Store consumer threads
         self._consumer_threads = []  # Store thread references
         self._stop_consuming = False
+        
+        # Log heartbeat configuration
+        self.logger.info(f"RabbitMQ service initialized with heartbeat={heartbeat}s, blocked_timeout={blocked_connection_timeout}s")
         
     def _get_connection(self):
         """Get or create a connection to RabbitMQ"""
@@ -259,3 +269,53 @@ class RabbitMQService(QueueService):
     def __del__(self):
         """Destructor to ensure connections are closed"""
         self.close_connection()
+
+    def _ack_message(self, connection, channel, delivery_tag):
+        """
+        Acknowledge message using connection callback (thread-safe)
+        Based on pika's threaded consumer pattern
+        """
+        if channel.is_open:
+            channel.basic_ack(delivery_tag)
+        else:
+            # Channel is already closed, log it
+            self.logger.warning(f"Cannot ACK message {delivery_tag}: channel is closed")
+    
+    def _nack_message(self, connection, channel, delivery_tag, requeue=False):
+        """
+        Negative acknowledge message using connection callback (thread-safe)
+        """
+        if channel.is_open:
+            channel.basic_nack(delivery_tag, requeue=requeue)
+        else:
+            # Channel is already closed, log it
+            self.logger.warning(f"Cannot NACK message {delivery_tag}: channel is closed")
+    
+    def _process_message_threaded(self, connection, channel, delivery_tag, body, handler):
+        """
+        Process message in a separate thread and safely acknowledge
+        This prevents blocking the consumer thread
+        """
+        thread_id = threading.get_ident()
+        try:
+            # Parse message body
+            data = json.loads(body)
+            
+            # Call user handler
+            handler(data)
+            
+            # Acknowledge message safely using connection callback
+            ack_callback = functools.partial(self._ack_message, connection, channel, delivery_tag)
+            connection.add_callback_threadsafe(ack_callback)
+            
+            self.logger.debug(f"Message processed successfully in thread {thread_id}, delivery_tag: {delivery_tag}")
+            
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Error parsing JSON message in thread {thread_id}: {str(e)}")
+            nack_callback = functools.partial(self._nack_message, connection, channel, delivery_tag, False)
+            connection.add_callback_threadsafe(nack_callback)
+            
+        except Exception as e:
+            self.logger.error(f"Error handling message in thread {thread_id}: {str(e)}")
+            nack_callback = functools.partial(self._nack_message, connection, channel, delivery_tag, False)
+            connection.add_callback_threadsafe(nack_callback)
