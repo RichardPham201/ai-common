@@ -1,14 +1,15 @@
 """RabbitMQ implementation of QueueService"""
 
 import pika
+from pika.exceptions import AMQPConnectionError, AMQPChannelError
 import json
 import logging
 import ssl
 import threading
 import functools
+import time
 from typing import Callable, Optional, Dict
 from .queue_service import QueueService
-
 
 class RabbitMQService(QueueService):
     """RabbitMQ implementation of the queue service"""
@@ -161,65 +162,99 @@ class RabbitMQService(QueueService):
 
     def _run_consumer(self, queue_name: str, handler: Callable[[dict], None]) -> None:
         """
-        Run consumer in its own thread with its own connection
+        Run consumer in its own thread with its own connection and auto-recovery
         
         Args:
             queue_name: Name of the queue to consume from
             handler: Callback function to handle incoming messages
         """
-        try:
-            # Create dedicated connection for this consumer
-            connection = pika.BlockingConnection(self.connection_params)
-            channel = connection.channel()
-            
-            # Declare queue with durability
-            channel.queue_declare(queue=queue_name, durable=True)
-            
-            # Set QoS to process one message at a time
-            channel.basic_qos(prefetch_count=1)
+        retry_count = 0
+        max_retries = 10  # Increased to 10 retries as requested
+        base_retry_delay = 5  # Changed to 5 seconds as requested
+        
+        while not self._stop_consuming:
+            connection = None
+            channel = None
+            try:
+                # Try to establish connection
+                self.logger.info(f"Attempting to connect to RabbitMQ for queue '{queue_name}' (attempt {retry_count + 1}/{max_retries})")
+                connection = pika.BlockingConnection(self.connection_params)
+                channel = connection.channel()
+                channel.queue_declare(queue=queue_name, durable=True)
+                channel.basic_qos(prefetch_count=1)
 
-            def callback(ch, method, properties, body):
-                """Internal callback wrapper"""
-                try:
-                    # Parse message body
-                    data = json.loads(body)
-                    
-                    # Call user handler
-                    handler(data)
-                    
-                    # Acknowledge message on success
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
-                    self.logger.debug(f"Message processed successfully from queue '{queue_name}'")
-                    
-                except json.JSONDecodeError as e:
-                    self.logger.error(f"Error parsing JSON message from queue '{queue_name}': {str(e)}")
-                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-                    
-                except Exception as e:
-                    self.logger.error(f"Error handling message from queue '{queue_name}': {str(e)}")
-                    ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                def callback(ch, method, properties, body):
+                    try:
+                        data = json.loads(body)
+                        handler(data)
+                        ch.basic_ack(delivery_tag=method.delivery_tag)
+                        self.logger.debug(f"Message processed successfully from queue '{queue_name}'")
+                    except json.JSONDecodeError as e:
+                        self.logger.error(f"Error parsing JSON message from queue '{queue_name}': {str(e)}")
+                        try:
+                            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                        except Exception:
+                            pass  # Channel might be closed
+                    except Exception as e:
+                        self.logger.error(f"Error handling message from queue '{queue_name}': {str(e)}")
+                        try:
+                            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                        except Exception:
+                            pass  # Channel might be closed
 
-            # Register consumer
-            channel.basic_consume(queue=queue_name, on_message_callback=callback)
-            
-            self.logger.info(f"Consumer started for queue '{queue_name}' in thread {threading.current_thread().name}")
-            
-            # Start consuming in this thread
-            while not self._stop_consuming:
-                try:
-                    connection.process_data_events(time_limit=1)  # Process events with timeout
-                except Exception as e:
-                    if not self._stop_consuming:
-                        self.logger.error(f"Error in consumer for queue '{queue_name}': {str(e)}")
-                        break
-            
-            # Cleanup
-            channel.stop_consuming()
-            connection.close()
-            self.logger.info(f"Consumer stopped for queue '{queue_name}'")
-            
-        except Exception as e:
-            self.logger.error(f"Error setting up consumer for queue '{queue_name}': {str(e)}")
+                channel.basic_consume(queue=queue_name, on_message_callback=callback)
+                self.logger.info(f"Consumer started for queue '{queue_name}' in thread {threading.current_thread().name}")
+                
+                # Reset retry count on successful connection
+                retry_count = 0
+
+                # Main consumer loop
+                while not self._stop_consuming:
+                    try:
+                        connection.process_data_events(time_limit=1)
+                    except (AMQPConnectionError, AMQPChannelError, ConnectionResetError, OSError) as e:
+                        if not self._stop_consuming:
+                            self.logger.warning(f"Connection/Channel lost for queue '{queue_name}': {str(e)}")
+                            break  # Break to outer loop for reconnection
+                    except Exception as e:
+                        if not self._stop_consuming:
+                            self.logger.error(f"Error in consumer for queue '{queue_name}': {str(e)}")
+                            break  # Break to outer loop for reconnection
+
+                # Clean exit from consumer loop
+                if self._stop_consuming:
+                    self.logger.info(f"Consumer stopped for queue '{queue_name}'")
+                    break
+                    
+            except Exception as e:
+                if self._stop_consuming:
+                    break
+                    
+                retry_count += 1
+                self.logger.error(f"Error setting up consumer for queue '{queue_name}' (attempt {retry_count}/{max_retries}): {str(e)}")
+                
+                if retry_count >= max_retries:
+                    self.logger.error(f"Max retries ({max_retries}) reached for consumer '{queue_name}'. Waiting {base_retry_delay}s before resetting retry count...")
+                    time.sleep(base_retry_delay)
+                    retry_count = 0  # Reset retry count to continue trying indefinitely
+                else:
+                    self.logger.info(f"Retrying consumer for queue '{queue_name}' in {base_retry_delay} seconds...")
+                    time.sleep(base_retry_delay)
+                    
+            finally:
+                # Always cleanup connections
+                if channel:
+                    try:
+                        channel.stop_consuming()
+                    except Exception as e:
+                        self.logger.debug(f"Error during channel cleanup for queue '{queue_name}': {str(e)}")
+                if connection and not connection.is_closed:
+                    try:
+                        connection.close()
+                    except Exception as e:
+                        self.logger.debug(f"Error during connection cleanup for queue '{queue_name}': {str(e)}")
+                        
+        self.logger.info(f"Consumer thread for queue '{queue_name}' has exited")
 
     def start_consuming_all(self) -> None:
         """
@@ -235,13 +270,28 @@ class RabbitMQService(QueueService):
         try:
             # Keep main thread alive while consumers run
             while not self._stop_consuming:
-                import time
                 time.sleep(1)
                 
-                # Check if any consumer threads have died
-                for thread in self._consumer_threads:
+                # Check if any consumer threads have died and restart them
+                for i, thread in enumerate(self._consumer_threads):
                     if not thread.is_alive():
-                        self.logger.warning(f"Consumer thread {thread.name} died")
+                        queue_name = thread.name.replace("Consumer-", "")
+                        self.logger.warning(f"Consumer thread {thread.name} died, restarting...")
+                        
+                        # Find the handler for this queue
+                        if queue_name in self._consumers:
+                            handler = self._consumers[queue_name]
+                            
+                            # Create and start a new consumer thread
+                            new_thread = threading.Thread(
+                                target=self._run_consumer,
+                                args=(queue_name, handler),
+                                daemon=True,
+                                name=f"Consumer-{queue_name}"
+                            )
+                            self._consumer_threads[i] = new_thread
+                            new_thread.start()
+                            self.logger.info(f"Restarted consumer thread for queue '{queue_name}'")
                         
         except KeyboardInterrupt:
             self.logger.info("Stopping all consumers...")
